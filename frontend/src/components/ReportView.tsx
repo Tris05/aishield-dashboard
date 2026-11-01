@@ -1,23 +1,675 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
-import { ShieldCheck, GitBranch, ExternalLink, Check, X, Sparkles, LockKeyhole } from "lucide-react";
 
-type Finding = { id:string; title:string; description?:string; severity:string; category?:string; path?:string; line?:number; recommendation?:string; scanner?:string; evidence?:string };
-type Scan = { project_id:string; scan_id:string; repository_url:string; provider:string; branch:string; commit_sha?:string; scan_status:string; created_at:string; report:{finding_count?:number;counts?:Record<string,number>;findings:Finding[];execution_summary?:{status?:string};coverage?:Array<{id:string;status:string}>} };
-type Proposal = {fix_id:string;finding_id:string;path:string;patch:string;status:string;decision:string;validation_message:string};
-const API=(process.env.NEXT_PUBLIC_API_BASE_URL||"http://localhost:8000").replace(/\/$/,"");
-const severityOrder=["critical","high","medium","low","info"];
-function count(scan:Scan|null, level:string){return scan?.report.counts?.[level]||0;}
-export default function ReportView({token}:{token:string}){
- const [scan,setScan]=useState<Scan|null>(null); const [loading,setLoading]=useState(true); const [error,setError]=useState(""); const [consent,setConsent]=useState(false); const [sessionId,setSessionId]=useState(""); const [proposals,setProposals]=useState<Proposal[]>([]); const [busy,setBusy]=useState(false); const [message,setMessage]=useState(""); const [pat,setPat]=useState(""); const [branch,setBranch]=useState(""); const [result,setResult]=useState<any>(null);
- useEffect(()=>{let active=true;(async()=>{try{const r=await fetch(`${API}/api/v1/public/scans/${encodeURIComponent(token)}`,{cache:"no-store"});if(!r.ok)throw new Error(r.status===404?"This dashboard link is invalid or expired.":"Could not load the scan report.");const data=await r.json();if(active){setScan(data);setBranch(`aishield/fix-${data.scan_id.slice(-8)}`)}}catch(e){if(active)setError(e instanceof Error?e.message:"Unexpected error") }finally{if(active)setLoading(false)}})();return()=>{active=false}},[token]);
- const counts=useMemo(()=>severityOrder.map(s=>({severity:s,value:count(scan,s)})),[scan]);
- async function startRemediation(){if(!consent||!scan)return;setBusy(true);setMessage("Recording consent…");try{const r=await fetch(`${API}/api/v1/public/scans/${encodeURIComponent(token)}/remediation/sessions`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({consent:true,finding_ids:[]})});const d=await r.json();if(!r.ok)throw new Error(d.detail||"Could not start remediation");setSessionId(d.session_id);setMessage("Retrieving finding context and generating patches with Gemini…");const g=await fetch(`${API}/api/v1/remediation/sessions/${d.session_id}/generate`,{method:"POST",headers:{"X-AIShield-Viewer-Token":token}});const gd=await g.json();if(!g.ok)throw new Error(gd.detail||"Patch generation failed");setProposals(gd.proposals||[]);setMessage(`Generated ${gd.proposals?.length||0} proposal(s). Review each diff before accepting.`)}catch(e){setMessage(e instanceof Error?e.message:"Remediation failed")}finally{setBusy(false)}}
- function decide(id:string,decision:string){setProposals(p=>p.map(x=>x.fix_id===id?{...x,decision}:x))}
- async function saveDecisions(){setBusy(true);try{const decisions=Object.fromEntries(proposals.filter(p=>p.status==="proposed"&&["accepted","rejected"].includes(p.decision)).map(p=>[p.fix_id,p.decision]));const r=await fetch(`${API}/api/v1/remediation/sessions/${sessionId}/decisions`,{method:"PATCH",headers:{"Content-Type":"application/json","X-AIShield-Viewer-Token":token},body:JSON.stringify({decisions})});const d=await r.json();if(!r.ok)throw new Error(d.detail||"Could not save decisions");setMessage("Your fix decisions have been saved.")}catch(e){setMessage(e instanceof Error?e.message:"Could not save decisions")}finally{setBusy(false)}}
- async function applyFixes(){if(!pat||!branch)return;setBusy(true);setMessage("Saving decisions, validating the complete patch set and pushing one branch…");try{const decisions=Object.fromEntries(proposals.filter(p=>p.status==="proposed"&&["accepted","rejected"].includes(p.decision)).map(p=>[p.fix_id,p.decision]));const saved=await fetch(`${API}/api/v1/remediation/sessions/${sessionId}/decisions`,{method:"PATCH",headers:{"Content-Type":"application/json","X-AIShield-Viewer-Token":token},body:JSON.stringify({decisions})});const sd=await saved.json();if(!saved.ok)throw new Error(sd.detail||"Could not save fix decisions");const r=await fetch(`${API}/api/v1/remediation/sessions/${sessionId}/apply`,{method:"POST",headers:{"Content-Type":"application/json","X-AIShield-Viewer-Token":token},body:JSON.stringify({git_token:pat,branch_name:branch})});const d=await r.json();if(!r.ok)throw new Error(d.detail||"Could not apply fixes");setResult(d);setPat("");setMessage(d.message)}catch(e){setMessage(e instanceof Error?e.message:"Apply failed")}finally{setBusy(false)}}
- if(loading)return <main className="loading-shell"><div className="spinner"/>Loading your AIShield report…</main>;
- if(error||!scan)return <main className="error-shell"><ShieldCheck size={34}/><h1>Report unavailable</h1><p>{error||"No report found."}</p><a href="/">Back to AIShield</a></main>;
- const findings=scan.report.findings||[]; const eligible=findings.filter(f=>["sast","ai-code-security","llm-application-security","secure-coding"].includes(f.category||"")&&f.path&&f.line&&["critical","high","medium"].includes(f.severity));
- return <main className="report-shell"><header className="report-topbar"><a className="brand" href="/"><span className="brand-mark"><ShieldCheck size={18}/></span> AIShield</a><span className="pill">SCAN REPORT</span></header><section className="report-heading"><div><div className="eyebrow"><span className="eyebrow-dot"/> REPOSITORY SECURITY REPORT</div><h1>{scan.repository_url.split("/").slice(-2).join(" / ")}</h1><p className="muted">Branch <strong>{scan.branch}</strong> · Commit <code>{(scan.commit_sha||"unknown").slice(0,12)}</code> · {new Date(scan.created_at).toLocaleString()}</p></div><div className="status-pill"><span/> {scan.scan_status.toUpperCase()}</div></section><section className="summary-grid"><div className="summary-main"><span className="metric-label">TOTAL FINDINGS</span><strong>{scan.report.finding_count??findings.length}</strong><span className="muted">Across all completed scanner stages</span></div>{counts.map(c=><div className={`severity-card sev-${c.severity}`} key={c.severity}><span>{c.severity}</span><strong>{c.value}</strong></div>)}</section><section className="section-heading"><div><span className="eyebrow">ASSESSMENT</span><h2>Security findings</h2></div><span className="muted">{findings.length} finding(s)</span></section><div className="finding-list">{findings.map((f,i)=><article className="finding-card" key={f.id||i}><div className="finding-meta"><span className={`severity-tag sev-${f.severity}`}>{f.severity}</span><span className="muted">{f.category||f.scanner||"finding"}</span><span className="muted">{f.path ? `${f.path}${f.line ? `:${f.line}` : ""}` : "Repository-wide"}</span></div><h3>{f.title}</h3><p>{f.description}</p>{f.recommendation&&<div className="recommendation"><strong>Recommended action</strong><p>{f.recommendation}</p></div>}</article>)}{!findings.length&&<div className="empty-state"><ShieldCheck size={32}/><h3>No findings were emitted</h3><p>Review execution status and scan coverage before interpreting this as clean.</p></div>}</div><section className="remediation-panel"><div className="remediation-title"><div className="icon-tile"><Sparkles/></div><div><span className="eyebrow">OPTIONAL · HUMAN REVIEW REQUIRED</span><h2>AI-assisted remediation</h2><p className="muted">Generate scoped patch proposals for eligible code findings. Nothing is changed until you explicitly accept fixes and provide a write token.</p></div></div><div className="consent-row"><input id="consent" type="checkbox" checked={consent} onChange={e=>setConsent(e.target.checked)}/><label htmlFor="consent">I consent to AIShield retrieving the relevant source files from this public repository and sending redacted snippets of selected findings to Gemini for patch generation. I understand source code is external data and proposals require review.</label></div><button className="button button-primary" disabled={!consent||busy||!eligible.length||!!sessionId} onClick={startRemediation}><Sparkles size={16}/>{busy?"Working…":"Enable AI remediation"}</button>{!eligible.length&&<p className="muted small">No findings currently meet the initial remediation eligibility rules.</p>}{message&&<p className="inline-message">{message}</p>}{proposals.length>0&&<><div className="proposal-toolbar"><button className="button button-secondary" disabled={busy||!proposals.some(p=>p.status==="proposed")} onClick={()=>setProposals(current=>current.map(p=>p.status==="proposed"?{...p,decision:"accepted"}:p))}>Accept All</button><button className="button button-secondary" disabled={busy||!proposals.some(p=>p.status==="proposed")} onClick={()=>setProposals(current=>current.map(p=>p.status==="proposed"?{...p,decision:"rejected"}:p))}>Reject All</button></div><div className="proposal-list">{proposals.map(p=><article className="proposal-card" key={p.fix_id||p.finding_id}><div className="proposal-head"><div><strong>{p.path}</strong><div className="muted small">Finding {p.finding_id.slice(0,12)} · {p.status}</div></div>{p.status==="proposed"&&<div className="decision-actions"><button className={p.decision==="accepted"?"decision selected":"decision"} onClick={()=>decide(p.fix_id,"accepted")}><Check size={14}/> Accept</button><button className={p.decision==="rejected"?"decision rejected":"decision"} onClick={()=>decide(p.fix_id,"rejected")}><X size={14}/> Reject</button></div>}</div>{p.patch?<pre className="diff-block">{p.patch}</pre>:<p className="muted">{p.validation_message}</p>}</article>)}</div><button className="button button-secondary" onClick={saveDecisions} disabled={busy}>Save fix decisions</button><div className="apply-box"><h3><GitBranch size={17}/> Apply accepted fixes</h3><p className="muted">AIShield validates the complete accepted patch set in an isolated clone, then creates one branch and one commit. A validation error prevents any push.</p><label>New branch name<input value={branch} onChange={e=>setBranch(e.target.value)} placeholder="aishield/fix-…"/></label><label>GitHub / GitLab Personal Access Token<input type="password" value={pat} onChange={e=>setPat(e.target.value)} placeholder="Provided only for this operation" autoComplete="off"/></label><button className="button button-primary" disabled={busy||!pat||!branch.trim()||!proposals.some(p=>p.status==="proposed"&&p.decision==="accepted")} onClick={applyFixes}>Apply All Accepted Fixes</button><p className="muted tiny"><LockKeyhole size={12}/> Your token is sent over HTTPS for the push operation and is not stored in the database.</p></div></>}{result&&<div className="success-panel"><h3><ShieldCheck/> Fix branch pushed</h3><p>Branch: <code>{result.branch_name}</code> · Commit: <code>{result.commit_sha?.slice(0,12)}</code></p><a href={result.compare_url} target="_blank" rel="noreferrer">Review changes / create PR or MR <ExternalLink size={14}/></a><p className="muted">Verification: {result.verification?.status} — {result.verification?.message}</p></div>}</section><footer className="landing-footer">AIShield POC · This report link is a bearer link. Share it only with people you trust.</footer></main>
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import {
+    ShieldCheck,
+    GitBranch,
+    ExternalLink,
+    Check,
+    X,
+    Sparkles,
+    LockKeyhole,
+} from "lucide-react";
+
+type Finding = {
+    id: string;
+    title: string;
+    description?: string;
+    severity: string;
+    category?: string;
+    path?: string;
+    line?: number;
+    recommendation?: string;
+    scanner?: string;
+    evidence?: string;
+};
+
+type Scan = {
+    project_id: string;
+    scan_id: string;
+    repository_url: string;
+    provider: string;
+    branch: string;
+    commit_sha?: string;
+    scan_status: string;
+    created_at: string;
+    report: {
+        finding_count?: number;
+        counts?: Record<string, number>;
+        findings: Finding[];
+        execution_summary?: { status?: string };
+        coverage?: Array<{ id: string; status: string }>;
+    };
+};
+
+type Proposal = {
+    fix_id: string;
+    finding_id: string;
+    path: string;
+    patch: string;
+    status: string;
+    decision: string;
+    validation_message: string;
+};
+
+type ApplyResult = {
+    message: string;
+    branch_name?: string;
+    commit_sha?: string;
+    compare_url?: string;
+    verification?: {
+        status?: string;
+        message?: string;
+    };
+};
+
+const API = (
+    process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000"
+).replace(/\/$/, "");
+
+const severityOrder = ["critical", "high", "medium", "low", "info"];
+
+function count(scan: Scan | null, level: string) {
+    return scan?.report.counts?.[level] || 0;
+}
+
+export default function ReportView({ token }: { token: string }) {
+    const [scan, setScan] = useState<Scan | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState("");
+    const [consent, setConsent] = useState(false);
+    const [sessionId, setSessionId] = useState("");
+    const [proposals, setProposals] = useState<Proposal[]>([]);
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState("");
+    const [pat, setPat] = useState("");
+    const [branch, setBranch] = useState("");
+    const [result, setResult] = useState<ApplyResult | null>(null);
+
+    useEffect(() => {
+        let active = true;
+
+        (async () => {
+            try {
+                const r = await fetch(
+                    `${API}/api/v1/public/scans/${encodeURIComponent(token)}`,
+                    { cache: "no-store" }
+                );
+
+                if (!r.ok) {
+                    throw new Error(
+                        r.status === 404
+                            ? "This dashboard link is invalid or expired."
+                            : "Could not load the scan report."
+                    );
+                }
+
+                const data = await r.json();
+
+                if (active) {
+                    setScan(data);
+                    setBranch(`aishield/fix-${data.scan_id.slice(-8)}`);
+                }
+            } catch (e) {
+                if (active) {
+                    setError(e instanceof Error ? e.message : "Unexpected error");
+                }
+            } finally {
+                if (active) {
+                    setLoading(false);
+                }
+            }
+        })();
+
+        return () => {
+            active = false;
+        };
+    }, [token]);
+
+    const counts = useMemo(
+        () =>
+            severityOrder.map((s) => ({
+                severity: s,
+                value: count(scan, s),
+            })),
+        [scan]
+    );
+
+    async function startRemediation() {
+        if (!consent || !scan) return;
+
+        setBusy(true);
+        setMessage("Recording consent…");
+
+        try {
+            const r = await fetch(
+                `${API}/api/v1/public/scans/${encodeURIComponent(token)}/remediation/sessions`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ consent: true, finding_ids: [] }),
+                }
+            );
+
+            const d = await r.json();
+
+            if (!r.ok) {
+                throw new Error(d.detail || "Could not start remediation");
+            }
+
+            setSessionId(d.session_id);
+            setMessage(
+                "Retrieving finding context and generating patches with Gemini…"
+            );
+
+            const g = await fetch(
+                `${API}/api/v1/remediation/sessions/${d.session_id}/generate`,
+                {
+                    method: "POST",
+                    headers: { "X-AIShield-Viewer-Token": token },
+                }
+            );
+
+            const gd = await g.json();
+
+            if (!g.ok) {
+                throw new Error(gd.detail || "Patch generation failed");
+            }
+
+            setProposals(gd.proposals || []);
+            setMessage(
+                `Generated ${gd.proposals?.length || 0} proposal(s). Review each diff before accepting.`
+            );
+        } catch (e) {
+            setMessage(e instanceof Error ? e.message : "Remediation failed");
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    function decide(id: string, decision: string) {
+        setProposals((p) =>
+            p.map((x) => (x.fix_id === id ? { ...x, decision } : x))
+        );
+    }
+
+    async function saveDecisions() {
+        setBusy(true);
+
+        try {
+            const decisions = Object.fromEntries(
+                proposals
+                    .filter(
+                        (p) =>
+                            p.status === "proposed" &&
+                            ["accepted", "rejected"].includes(p.decision)
+                    )
+                    .map((p) => [p.fix_id, p.decision])
+            );
+
+            const r = await fetch(
+                `${API}/api/v1/remediation/sessions/${sessionId}/decisions`,
+                {
+                    method: "PATCH",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-AIShield-Viewer-Token": token,
+                    },
+                    body: JSON.stringify({ decisions }),
+                }
+            );
+
+            const d = await r.json();
+
+            if (!r.ok) {
+                throw new Error(d.detail || "Could not save decisions");
+            }
+
+            setMessage("Your fix decisions have been saved.");
+        } catch (e) {
+            setMessage(
+                e instanceof Error ? e.message : "Could not save decisions"
+            );
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function applyFixes() {
+        if (!pat || !branch) return;
+
+        setBusy(true);
+        setMessage(
+            "Saving decisions, validating the complete patch set and pushing one branch…"
+        );
+
+        try {
+            const decisions = Object.fromEntries(
+                proposals
+                    .filter(
+                        (p) =>
+                            p.status === "proposed" &&
+                            ["accepted", "rejected"].includes(p.decision)
+                    )
+                    .map((p) => [p.fix_id, p.decision])
+            );
+
+            const saved = await fetch(
+                `${API}/api/v1/remediation/sessions/${sessionId}/decisions`,
+                {
+                    method: "PATCH",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-AIShield-Viewer-Token": token,
+                    },
+                    body: JSON.stringify({ decisions }),
+                }
+            );
+
+            const sd = await saved.json();
+
+            if (!saved.ok) {
+                throw new Error(sd.detail || "Could not save fix decisions");
+            }
+
+            const r = await fetch(
+                `${API}/api/v1/remediation/sessions/${sessionId}/apply`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-AIShield-Viewer-Token": token,
+                    },
+                    body: JSON.stringify({
+                        git_token: pat,
+                        branch_name: branch,
+                    }),
+                }
+            );
+
+            const d: ApplyResult = await r.json();
+
+            if (!r.ok) {
+                throw new Error(d.message || "Could not apply fixes");
+            }
+
+            setResult(d);
+            setPat("");
+            setMessage(d.message);
+        } catch (e) {
+            setMessage(e instanceof Error ? e.message : "Apply failed");
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    if (loading) {
+        return (
+            <main className="loading-shell">
+                <div className="spinner" />
+                Loading your AIShield report…
+            </main>
+        );
+    }
+
+    if (error || !scan) {
+        return (
+            <main className="error-shell">
+                <ShieldCheck size={34} />
+                <h1>Report unavailable</h1>
+                <p>{error || "No report found."}</p>
+                <Link href="/">Back to AIShield</Link>
+            </main>
+        );
+    }
+
+    const findings = scan.report.findings || [];
+
+    const eligible = findings.filter(
+        (f) =>
+            ["sast", "ai-code-security", "llm-application-security", "secure-coding"].includes(
+                f.category || ""
+            ) &&
+            f.path &&
+            f.line &&
+            ["critical", "high", "medium"].includes(f.severity)
+    );
+
+    return (
+        <main className="report-shell">
+            <header className="report-topbar">
+                <Link className="brand" href="/">
+                    <span className="brand-mark">
+                        <ShieldCheck size={18} />
+                    </span>
+                    AIShield
+                </Link>
+                <span className="pill">SCAN REPORT</span>
+            </header>
+
+            <section className="report-heading">
+                <div>
+                    <div className="eyebrow">
+                        <span className="eyebrow-dot" /> REPOSITORY SECURITY REPORT
+                    </div>
+                    <h1>{scan.repository_url.split("/").slice(-2).join(" / ")}</h1>
+                    <p className="muted">
+                        Branch <strong>{scan.branch}</strong> · Commit{" "}
+                        <code>{(scan.commit_sha || "unknown").slice(0, 12)}</code> ·{" "}
+                        {new Date(scan.created_at).toLocaleString()}
+                    </p>
+                </div>
+                <div className="status-pill">
+                    <span /> {scan.scan_status.toUpperCase()}
+                </div>
+            </section>
+
+            <section className="summary-grid">
+                <div className="summary-main">
+                    <span className="metric-label">TOTAL FINDINGS</span>
+                    <strong>{scan.report.finding_count ?? findings.length}</strong>
+                    <span className="muted">
+                        Across all completed scanner stages
+                    </span>
+                </div>
+
+                {counts.map((c) => (
+                    <div
+                        className={`severity-card sev-${c.severity}`}
+                        key={c.severity}
+                    >
+                        <span>{c.severity}</span>
+                        <strong>{c.value}</strong>
+                    </div>
+                ))}
+            </section>
+
+            <section className="section-heading">
+                <div>
+                    <span className="eyebrow">ASSESSMENT</span>
+                    <h2>Security findings</h2>
+                </div>
+                <span className="muted">{findings.length} finding(s)</span>
+            </section>
+
+            <div className="finding-list">
+                {findings.map((f, i) => (
+                    <article className="finding-card" key={f.id || i}>
+                        <div className="finding-meta">
+                            <span className={`severity-tag sev-${f.severity}`}>
+                                {f.severity}
+                            </span>
+                            <span className="muted">
+                                {f.category || f.scanner || "finding"}
+                            </span>
+                            <span className="muted">
+                                {f.path
+                                    ? `${f.path}${f.line ? `:${f.line}` : ""}`
+                                    : "Repository-wide"}
+                            </span>
+                        </div>
+
+                        <h3>{f.title}</h3>
+                        <p>{f.description}</p>
+
+                        {f.recommendation && (
+                            <div className="recommendation">
+                                <strong>Recommended action</strong>
+                                <p>{f.recommendation}</p>
+                            </div>
+                        )}
+                    </article>
+                ))}
+
+                {!findings.length && (
+                    <div className="empty-state">
+                        <ShieldCheck size={32} />
+                        <h3>No findings were emitted</h3>
+                        <p>
+                            Review execution status and scan coverage before interpreting
+                            this as clean.
+                        </p>
+                    </div>
+                )}
+            </div>
+
+            <section className="remediation-panel">
+                <div className="remediation-title">
+                    <div className="icon-tile">
+                        <Sparkles />
+                    </div>
+                    <div>
+                        <span className="eyebrow">
+                            OPTIONAL · HUMAN REVIEW REQUIRED
+                        </span>
+                        <h2>AI-assisted remediation</h2>
+                        <p className="muted">
+                            Generate scoped patch proposals for eligible code findings.
+                            Nothing is changed until you explicitly accept fixes and provide
+                            a write token.
+                        </p>
+                    </div>
+                </div>
+
+                <div className="consent-row">
+                    <input
+                        id="consent"
+                        type="checkbox"
+                        checked={consent}
+                        onChange={(e) => setConsent(e.target.checked)}
+                    />
+                    <label htmlFor="consent">
+                        I consent to AIShield retrieving the relevant source files from
+                        this public repository and sending redacted snippets of selected
+                        findings to Gemini for patch generation. I understand source code
+                        is external data and proposals require review.
+                    </label>
+                </div>
+
+                <button
+                    className="button button-primary"
+                    disabled={!consent || busy || !eligible.length || !!sessionId}
+                    onClick={startRemediation}
+                >
+                    <Sparkles size={16} />
+                    {busy ? "Working…" : "Enable AI remediation"}
+                </button>
+
+                {!eligible.length && (
+                    <p className="muted small">
+                        No findings currently meet the initial remediation eligibility
+                        rules.
+                    </p>
+                )}
+
+                {message && <p className="inline-message">{message}</p>}
+
+                {proposals.length > 0 && (
+                    <>
+                        <div className="proposal-toolbar">
+                            <button
+                                className="button button-secondary"
+                                disabled={
+                                    busy || !proposals.some((p) => p.status === "proposed")
+                                }
+                                onClick={() =>
+                                    setProposals((current) =>
+                                        current.map((p) =>
+                                            p.status === "proposed"
+                                                ? { ...p, decision: "accepted" }
+                                                : p
+                                        )
+                                    )
+                                }
+                            >
+                                Accept All
+                            </button>
+
+                            <button
+                                className="button button-secondary"
+                                disabled={
+                                    busy || !proposals.some((p) => p.status === "proposed")
+                                }
+                                onClick={() =>
+                                    setProposals((current) =>
+                                        current.map((p) =>
+                                            p.status === "proposed"
+                                                ? { ...p, decision: "rejected" }
+                                                : p
+                                        )
+                                    )
+                                }
+                            >
+                                Reject All
+                            </button>
+                        </div>
+
+                        <div className="proposal-list">
+                            {proposals.map((p) => (
+                                <article
+                                    className="proposal-card"
+                                    key={p.fix_id || p.finding_id}
+                                >
+                                    <div className="proposal-head">
+                                        <div>
+                                            <strong>{p.path}</strong>
+                                            <div className="muted small">
+                                                Finding {p.finding_id.slice(0, 12)} · {p.status}
+                                            </div>
+                                        </div>
+
+                                        {p.status === "proposed" && (
+                                            <div className="decision-actions">
+                                                <button
+                                                    className={
+                                                        p.decision === "accepted"
+                                                            ? "decision selected"
+                                                            : "decision"
+                                                    }
+                                                    onClick={() => decide(p.fix_id, "accepted")}
+                                                >
+                                                    <Check size={14} /> Accept
+                                                </button>
+
+                                                <button
+                                                    className={
+                                                        p.decision === "rejected"
+                                                            ? "decision rejected"
+                                                            : "decision"
+                                                    }
+                                                    onClick={() => decide(p.fix_id, "rejected")}
+                                                >
+                                                    <X size={14} /> Reject
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {p.patch ? (
+                                        <pre className="diff-block">{p.patch}</pre>
+                                    ) : (
+                                        <p className="muted">{p.validation_message}</p>
+                                    )}
+                                </article>
+                            ))}
+                        </div>
+
+                        <button
+                            className="button button-secondary"
+                            onClick={saveDecisions}
+                            disabled={busy}
+                        >
+                            Save fix decisions
+                        </button>
+
+                        <div className="apply-box">
+                            <h3>
+                                <GitBranch size={17} /> Apply accepted fixes
+                            </h3>
+                            <p className="muted">
+                                AIShield validates the complete accepted patch set in an
+                                isolated clone, then creates one branch and one commit. A
+                                validation error prevents any push.
+                            </p>
+
+                            <label>
+                                New branch name
+                                <input
+                                    value={branch}
+                                    onChange={(e) => setBranch(e.target.value)}
+                                    placeholder="aishield/fix-…"
+                                />
+                            </label>
+
+                            <label>
+                                GitHub / GitLab Personal Access Token
+                                <input
+                                    type="password"
+                                    value={pat}
+                                    onChange={(e) => setPat(e.target.value)}
+                                    placeholder="Provided only for this operation"
+                                    autoComplete="off"
+                                />
+                            </label>
+
+                            <button
+                                className="button button-primary"
+                                disabled={
+                                    busy ||
+                                    !pat ||
+                                    !branch.trim() ||
+                                    !proposals.some(
+                                        (p) =>
+                                            p.status === "proposed" &&
+                                            p.decision === "accepted"
+                                    )
+                                }
+                                onClick={applyFixes}
+                            >
+                                Apply All Accepted Fixes
+                            </button>
+
+                            <p className="muted tiny">
+                                <LockKeyhole size={12} /> Your token is sent over HTTPS for
+                                the push operation and is not stored in the database.
+                            </p>
+                        </div>
+                    </>
+                )}
+
+                {result && (
+                    <div className="success-panel">
+                        <h3>
+                            <ShieldCheck /> Fix branch pushed
+                        </h3>
+                        <p>
+                            Branch: <code>{result.branch_name}</code> · Commit:{" "}
+                            <code>{result.commit_sha?.slice(0, 12)}</code>
+                        </p>
+
+                        {result.compare_url && (
+                            <a
+                                href={result.compare_url}
+                                target="_blank"
+                                rel="noreferrer"
+                            >
+                                Review changes / create PR or MR <ExternalLink size={14} />
+                            </a>
+                        )}
+
+                        <p className="muted">
+                            Verification: {result.verification?.status} —{" "}
+                            {result.verification?.message}
+                        </p>
+                    </div>
+                )}
+            </section>
+
+            <footer className="landing-footer">
+                AIShield POC · This report link is a bearer link. Share it only with
+                people you trust.
+            </footer>
+        </main>
+    );
 }
