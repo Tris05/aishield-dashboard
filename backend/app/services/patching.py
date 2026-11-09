@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -14,13 +13,91 @@ from fastapi import HTTPException
 
 from .source import safe_relative_path
 
-
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------
 # PATCH VALIDATION
 # ---------------------------------------------------------------------
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<suffix>.*)$"
+)
+
+def normalize_hunk_counts(patch: str) -> tuple[str, str | None]:
+    """
+    Recalculate unified-diff hunk counts from the actual hunk lines.
+
+    This repairs incorrect counts in @@ headers, but deliberately does not
+    repair malformed diff lines, missing context, or patches for the wrong
+    source revision. Git applicability must still be checked separately.
+    """
+    if not isinstance(patch, str) or not patch.strip():
+        return patch, "Patch is empty."
+
+    patch = patch.lstrip("\ufeff\r\n\t ")
+    lines = patch.splitlines()
+    normalized: list[str] = []
+    hunk_count = 0
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        match = _HUNK_HEADER_RE.match(line)
+
+        if not match:
+            normalized.append(line)
+            i += 1
+            continue
+
+        hunk_count += 1
+        old_count = 0
+        new_count = 0
+        hunk_lines: list[str] = []
+        i += 1
+
+        while i < len(lines):
+            current = lines[i]
+
+            if current.startswith("@@ ") or current.startswith("diff --git "):
+                break
+
+            if current == r"\ No newline at end of file":
+                hunk_lines.append(current)
+                i += 1
+                continue
+
+            if current.startswith(" "):
+                old_count += 1
+                new_count += 1
+            elif current.startswith("-"):
+                old_count += 1
+            elif current.startswith("+"):
+                new_count += 1
+            else:
+                return patch, (
+                    "Invalid unified-diff line inside hunk: "
+                    f"{current!r}"
+                )
+
+            hunk_lines.append(current)
+            i += 1
+
+        if not hunk_lines or (old_count == 0 and new_count == 0):
+            return patch, "Unified-diff hunk contains no changes."
+
+        corrected_header = (
+            f"@@ -{match.group('old_start')},{old_count} "
+            f"+{match.group('new_start')},{new_count} @@"
+            f"{match.group('suffix')}"
+        )
+        normalized.append(corrected_header)
+        normalized.extend(hunk_lines)
+
+    if hunk_count == 0:
+        return patch, "Patch contains no unified-diff hunks."
+
+    return "\n".join(normalized) + "\n", None
 
 def validate_diff(
     patch: str,
@@ -100,7 +177,6 @@ def validate_diff(
         "is checked against the scanned commit.",
     )
 
-
 # ---------------------------------------------------------------------
 # GIT EXECUTION
 # ---------------------------------------------------------------------
@@ -125,7 +201,6 @@ def run_git(
         check=False,
     )
 
-
 def _git_error(
     result: subprocess.CompletedProcess,
 ) -> str:
@@ -145,7 +220,6 @@ def _git_error(
     )
 
     return message[:1500]
-
 
 # ---------------------------------------------------------------------
 # APPLY AND PUSH
@@ -267,9 +341,14 @@ def apply_and_push(
                 detail=f"Invalid patch supplied for {rel}.",
             )
 
-        # Normalize leading BOM/whitespace once.
-        # Use this exact value for validation and Git application.
-        patch = patch.lstrip("\ufeff\r\n\t ")
+        # Normalize the response and repair hunk counts before validation.
+        patch = patch.lstrip("\ufeff\\r\\n\\t ")
+        patch, hunk_error = normalize_hunk_counts(patch)
+        if hunk_error:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Malformed patch for {rel}: {hunk_error}",
+            )
 
         ok, message = validate_diff(
             patch,
@@ -533,6 +612,14 @@ def apply_and_push(
                     ),
                 )
 
+            # Recalculate hunk counts again at the final application boundary.
+            patch, hunk_error = normalize_hunk_counts(patch)
+            if hunk_error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Malformed patch for {rel}: {hunk_error}",
+                )
+
             # Revalidate the exact normalized patch.
             ok, message = validate_diff(
                 patch,
@@ -552,6 +639,7 @@ def apply_and_push(
             check = run_git(
                 [
                     "apply",
+                    "--recount",
                     "--check",
                     "--whitespace=error",
                 ],
@@ -587,6 +675,7 @@ def apply_and_push(
             applied = run_git(
                 [
                     "apply",
+                    "--recount",
                     "--whitespace=error",
                 ],
                 repo,
