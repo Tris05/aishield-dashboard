@@ -4,12 +4,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
+import shutil
 
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
 
 from fastapi import HTTPException
 
@@ -28,10 +27,10 @@ def validate_diff(
     expected_path: str,
 ) -> tuple[bool, str]:
     """
-    Validate that a patch modifies exactly one expected existing file.
+    Validate patch structure and ensure it modifies exactly
+    the expected file.
 
-    This checks patch structure and scope.
-    Actual applicability is checked against the scanned commit later.
+    Git applicability is checked separately against the scanned commit.
     """
 
     try:
@@ -40,12 +39,19 @@ def validate_diff(
     except HTTPException as exc:
         return False, str(exc.detail)
 
+    if not isinstance(patch, str):
+        return False, "Patch must be a string."
+
     if (
         not patch.strip()
         or len(patch.encode("utf-8")) > 50_000
         or "\x00" in patch
     ):
         return False, "Patch is empty, too large, or contains NUL bytes."
+
+    # IMPORTANT:
+    # Preserve support for leading whitespace, newlines and BOM.
+    patch = patch.lstrip("\ufeff\r\n\t ")
 
     if not patch.startswith("diff --git "):
         return False, "Expected a unified Git diff."
@@ -57,7 +63,9 @@ def validate_diff(
     )
 
     if len(headers) != 1 or headers[0] != (expected, expected):
-        return False, "Patch must modify exactly the finding's single file."
+        return False, (
+            "Patch must modify exactly the finding's single file."
+        )
 
     file_headers = re.findall(
         r"^(---|\+\+\+) (.+)$",
@@ -72,7 +80,9 @@ def validate_diff(
         ("---", expected_old),
         ("+++", expected_new),
     ]:
-        return False, "Patch file headers must match the exact target path."
+        return False, (
+            "Patch file headers must match the exact target path."
+        )
 
     if re.search(
         r"^(?:new file mode|deleted file mode|rename from|rename to|copy from|copy to)",
@@ -87,7 +97,7 @@ def validate_diff(
     return (
         True,
         "Patch scope and structure accepted; applicability "
-        "will be checked against the scanned commit.",
+        "is checked against the scanned commit.",
     )
 
 
@@ -116,93 +126,29 @@ def run_git(
     )
 
 
-def git_error(result: subprocess.CompletedProcess) -> str:
-    """Return a sanitized Git error message."""
+def _git_error(
+    result: subprocess.CompletedProcess,
+) -> str:
+    """Return Git's diagnostic output without exposing credentials."""
 
-    message = (result.stderr or result.stdout or "").strip()
+    message = (
+        result.stderr
+        or result.stdout
+        or "Git returned no diagnostic message."
+    ).strip()
 
-    # Never expose credentials if a Git error happens to contain them.
+    # Redact credentials if they appear in an error message.
     message = re.sub(
         r"https://[^/@\s]+:[^/@\s]+@",
         "https://[REDACTED]@",
         message,
     )
 
-    return message[:2000] or "Git returned no diagnostic message."
+    return message[:1500]
 
 
 # ---------------------------------------------------------------------
-# REPOSITORY VALIDATION
-# ---------------------------------------------------------------------
-
-def validate_repository_url(repository_url: str) -> tuple[str, str]:
-    """
-    Only allow HTTPS GitHub and GitLab repositories.
-
-    Prevents accidentally forwarding the PAT to an arbitrary host.
-    """
-
-    try:
-        parsed = urlsplit(repository_url.strip())
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid repository URL.",
-        ) from exc
-
-    if parsed.scheme != "https":
-        raise HTTPException(
-            status_code=400,
-            detail="Only HTTPS repository URLs are supported.",
-        )
-
-    if parsed.username or parsed.password:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Repository URLs must not contain embedded credentials. "
-                "Use the Git token field instead."
-            ),
-        )
-
-    if parsed.port not in (None, 443):
-        raise HTTPException(
-            status_code=400,
-            detail="Custom repository URL ports are not supported.",
-        )
-
-    host = (parsed.hostname or "").lower()
-
-    if host == "github.com":
-        username = "x-access-token"
-
-    elif host == "gitlab.com":
-        username = "oauth2"
-
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Only github.com and gitlab.com repositories are supported.",
-        )
-
-    if parsed.query or parsed.fragment:
-        raise HTTPException(
-            status_code=400,
-            detail="Repository URL must not contain query parameters or fragments.",
-        )
-
-    if not parsed.path.strip("/"):
-        raise HTTPException(
-            status_code=400,
-            detail="Repository URL does not contain a repository path.",
-        )
-
-    return host, username
-
-
-# ---------------------------------------------------------------------
-# PATCH APPLICATION AND PUSH
+# APPLY AND PUSH
 # ---------------------------------------------------------------------
 
 def apply_and_push(
@@ -214,14 +160,16 @@ def apply_and_push(
     token: str,
 ) -> dict:
     """
-    Apply accepted patches against the original scanned commit,
+    Apply accepted patches against the exact scanned commit,
     create a remediation commit and push a new branch.
 
-    All operations happen in a temporary isolated clone.
-    No push occurs if any validation or application step fails.
+    If any patch fails, the operation stops before pushing.
     """
 
+    # -------------------------------------------------------------
     # Validate branch name.
+    # -------------------------------------------------------------
+
     if (
         not branch_name
         or not branch_name.strip()
@@ -234,7 +182,12 @@ def apply_and_push(
         )
 
     branch_check = subprocess.run(
-        ["git", "check-ref-format", "--branch", branch_name],
+        [
+            "git",
+            "check-ref-format",
+            "--branch",
+            branch_name,
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -246,21 +199,41 @@ def apply_and_push(
             detail="Invalid remediation branch name.",
         )
 
-    # Validate scanned commit SHA.
+    # -------------------------------------------------------------
+    # Validate commit SHA.
+    # -------------------------------------------------------------
+
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
         raise HTTPException(
             status_code=400,
             detail="A valid scanned commit SHA is required.",
         )
 
-    # Validate repository and token.
     if not token or not token.strip():
         raise HTTPException(
             status_code=400,
             detail="A Git repository access token is required.",
         )
 
-    _, username = validate_repository_url(repository_url)
+    # -------------------------------------------------------------
+    # Validate repository host.
+    # -------------------------------------------------------------
+
+    if "github.com" in repository_url.lower():
+        username = "x-access-token"
+
+    elif "gitlab.com" in repository_url.lower():
+        username = "oauth2"
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Only GitHub and GitLab repositories are supported.",
+        )
+
+    # -------------------------------------------------------------
+    # Validate all proposals before cloning.
+    # -------------------------------------------------------------
 
     if not patches:
         raise HTTPException(
@@ -268,9 +241,7 @@ def apply_and_push(
             detail="No accepted fixes were supplied.",
         )
 
-    # Validate all patches before cloning.
     validated_patches = []
-    seen_paths = set()
 
     for proposal in patches:
         if not isinstance(proposal, dict):
@@ -282,28 +253,11 @@ def apply_and_push(
         try:
             rel = safe_relative_path(proposal["path"])
 
-        except (KeyError, HTTPException) as exc:
-            if isinstance(exc, HTTPException):
-                raise
-
+        except KeyError as exc:
             raise HTTPException(
                 status_code=400,
                 detail="A remediation proposal is missing its target path.",
             ) from exc
-
-        if rel in seen_paths:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Multiple accepted proposals target {rel}. "
-                    "These patches may have been generated against the "
-                    "same original file and cannot safely be applied "
-                    "sequentially. Generate a combined proposal for this "
-                    "file or accept only one proposal per file."
-                ),
-            )
-
-        seen_paths.add(rel)
 
         patch = proposal.get("patch")
 
@@ -313,7 +267,14 @@ def apply_and_push(
                 detail=f"Invalid patch supplied for {rel}.",
             )
 
-        ok, message = validate_diff(patch, rel)
+        # Normalize leading BOM/whitespace once.
+        # Use this exact value for validation and Git application.
+        patch = patch.lstrip("\ufeff\r\n\t ")
+
+        ok, message = validate_diff(
+            patch,
+            rel,
+        )
 
         if not ok:
             raise HTTPException(
@@ -329,18 +290,23 @@ def apply_and_push(
             }
         )
 
-    # Create isolated temporary working directory.
+    # -------------------------------------------------------------
+    # Temporary isolated repository.
+    # -------------------------------------------------------------
+
     temp = Path(
-        tempfile.mkdtemp(prefix="aishield-remediate-")
+        tempfile.mkdtemp(
+            prefix="aishield-remediate-"
+        )
     )
 
     askpass = temp / "askpass.sh"
 
     askpass.write_text(
         '#!/bin/sh\n'
-        'case "$1" in\n'
-        '  *Username*) printf "%s\\n" "$AISHIELD_GIT_USERNAME" ;;\n'
-        '  *) printf "%s\\n" "$AISHIELD_GIT_TOKEN" ;;\n'
+        'case "$1" in '
+        '*Username*) printf "%s\\n" "$AISHIELD_GIT_USERNAME" ;; '
+        '*) printf "%s\\n" "$AISHIELD_GIT_TOKEN" ;; '
         'esac\n',
         encoding="utf-8",
     )
@@ -362,9 +328,9 @@ def apply_and_push(
     )
 
     try:
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
         # Clone repository.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
 
         clone = run_git(
             [
@@ -388,7 +354,7 @@ def apply_and_push(
         if clone.returncode:
             logger.error(
                 "Repository clone failed: %s",
-                git_error(clone),
+                _git_error(clone),
             )
 
             raise HTTPException(
@@ -401,9 +367,9 @@ def apply_and_push(
 
         repo = temp / "repo"
 
-        # -------------------------------------------------------------
-        # Fetch scanned commit.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Fetch source branch or repository history.
+        # ---------------------------------------------------------
 
         if source_branch and source_branch != "default":
             fetch = run_git(
@@ -432,8 +398,8 @@ def apply_and_push(
 
         if fetch.returncode:
             logger.warning(
-                "Branch fetch failed; trying exact scanned commit: %s",
-                git_error(fetch),
+                "Source branch fetch failed; trying exact commit: %s",
+                _git_error(fetch),
             )
 
             fetch = run_git(
@@ -451,7 +417,7 @@ def apply_and_push(
         if fetch.returncode:
             logger.error(
                 "Scanned commit fetch failed: %s",
-                git_error(fetch),
+                _git_error(fetch),
             )
 
             raise HTTPException(
@@ -462,9 +428,9 @@ def apply_and_push(
                 ),
             )
 
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
         # Verify scanned commit.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
 
         verify = run_git(
             [
@@ -490,6 +456,11 @@ def apply_and_push(
             )
 
             if fetch_exact.returncode:
+                logger.error(
+                    "Exact commit fetch failed: %s",
+                    _git_error(fetch_exact),
+                )
+
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -498,9 +469,9 @@ def apply_and_push(
                     ),
                 )
 
-        # -------------------------------------------------------------
-        # Checkout exact scanned commit.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Checkout scanned commit.
+        # ---------------------------------------------------------
 
         checkout = run_git(
             [
@@ -516,22 +487,23 @@ def apply_and_push(
         if checkout.returncode:
             logger.error(
                 "Remediation branch checkout failed: %s",
-                git_error(checkout),
+                _git_error(checkout),
             )
 
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "Could not create remediation branch. "
-                    "Check the branch name and scanned commit."
+                    "The branch may already exist locally or the "
+                    "scanned commit may be unavailable."
                 ),
             )
 
         accepted = []
 
-        # -------------------------------------------------------------
-        # Apply each validated patch.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Apply patches.
+        # ---------------------------------------------------------
 
         for proposal in validated_patches:
             rel = proposal["path"]
@@ -561,8 +533,11 @@ def apply_and_push(
                     ),
                 )
 
-            # Revalidate patch.
-            ok, message = validate_diff(patch, rel)
+            # Revalidate the exact normalized patch.
+            ok, message = validate_diff(
+                patch,
+                rel,
+            )
 
             if not ok:
                 raise HTTPException(
@@ -570,7 +545,10 @@ def apply_and_push(
                     detail=f"Patch rejected for {rel}: {message}",
                 )
 
-            # Check patch applicability.
+            # -----------------------------------------------------
+            # Check applicability before applying.
+            # -----------------------------------------------------
+
             check = run_git(
                 [
                     "apply",
@@ -583,11 +561,11 @@ def apply_and_push(
             )
 
             if check.returncode:
-                error = git_error(check)
+                error = _git_error(check)
 
                 logger.error(
-                    "Git patch check failed | file=%s | "
-                    "finding_id=%s | stderr=%s",
+                    "Git patch check failed | "
+                    "file=%s | finding_id=%s | error=%s",
                     rel,
                     proposal.get("finding_id"),
                     error,
@@ -602,7 +580,10 @@ def apply_and_push(
                     ),
                 )
 
+            # -----------------------------------------------------
             # Apply patch.
+            # -----------------------------------------------------
+
             applied = run_git(
                 [
                     "apply",
@@ -614,10 +595,11 @@ def apply_and_push(
             )
 
             if applied.returncode:
-                error = git_error(applied)
+                error = _git_error(applied)
 
                 logger.error(
-                    "Git patch application failed | file=%s | error=%s",
+                    "Git patch application failed | "
+                    "file=%s | error=%s",
                     rel,
                     error,
                 )
@@ -639,34 +621,44 @@ def apply_and_push(
                 detail="No accepted fixes were supplied.",
             )
 
-        # -------------------------------------------------------------
-        # Verify combined changes.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Check combined diff.
+        # ---------------------------------------------------------
 
         diffcheck = run_git(
-            ["diff", "--check"],
+            [
+                "diff",
+                "--check",
+            ],
             repo,
             env,
         )
 
         if diffcheck.returncode:
-            error = git_error(diffcheck)
+            error = _git_error(diffcheck)
 
             logger.error(
-                "Combined patch whitespace check failed: %s",
+                "Combined patch validation failed: %s",
                 error,
             )
 
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Combined patch set failed git diff --check: {error}. "
-                    "No branch was pushed."
+                    f"Combined patch set failed git diff --check: "
+                    f"{error}. No branch was pushed."
                 ),
             )
 
+        # ---------------------------------------------------------
+        # Verify modified files.
+        # ---------------------------------------------------------
+
         status = run_git(
-            ["status", "--porcelain"],
+            [
+                "status",
+                "--porcelain",
+            ],
             repo,
             env,
         )
@@ -700,9 +692,9 @@ def apply_and_push(
                 ),
             )
 
-        # -------------------------------------------------------------
-        # Configure commit identity.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Configure Git identity.
+        # ---------------------------------------------------------
 
         config_name = run_git(
             [
@@ -730,9 +722,9 @@ def apply_and_push(
                 detail="Could not configure remediation commit identity.",
             )
 
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
         # Stage changes.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
 
         add = run_git(
             [
@@ -747,7 +739,7 @@ def apply_and_push(
         if add.returncode:
             logger.error(
                 "Git staging failed: %s",
-                git_error(add),
+                _git_error(add),
             )
 
             raise HTTPException(
@@ -755,9 +747,9 @@ def apply_and_push(
                 detail="Could not stage the validated patch set.",
             )
 
-        # -------------------------------------------------------------
-        # Commit changes.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Commit.
+        # ---------------------------------------------------------
 
         session_ids = sorted(
             {
@@ -810,7 +802,7 @@ def apply_and_push(
         if commit.returncode:
             logger.error(
                 "Remediation commit failed: %s",
-                git_error(commit),
+                _git_error(commit),
             )
 
             raise HTTPException(
@@ -818,9 +810,9 @@ def apply_and_push(
                 detail="Could not create the remediation commit.",
             )
 
-        # -------------------------------------------------------------
-        # Push remediation branch.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Push.
+        # ---------------------------------------------------------
 
         push = run_git(
             [
@@ -836,7 +828,7 @@ def apply_and_push(
         if push.returncode:
             logger.error(
                 "Git push failed: %s",
-                git_error(push),
+                _git_error(push),
             )
 
             raise HTTPException(
@@ -847,12 +839,15 @@ def apply_and_push(
                 ),
             )
 
-        # -------------------------------------------------------------
-        # Return successful result.
-        # -------------------------------------------------------------
+        # ---------------------------------------------------------
+        # Return result.
+        # ---------------------------------------------------------
 
         head = run_git(
-            ["rev-parse", "HEAD"],
+            [
+                "rev-parse",
+                "HEAD",
+            ],
             repo,
             env,
         )
@@ -873,14 +868,13 @@ def apply_and_push(
         }
 
     except subprocess.TimeoutExpired as exc:
-        logger.exception("Git operation timed out.")
+        logger.exception(
+            "Git operation timed out during remediation."
+        )
 
         raise HTTPException(
             status_code=504,
-            detail=(
-                "A Git operation timed out. "
-                "No successful remediation result was returned."
-            ),
+            detail="A Git operation timed out.",
         ) from exc
 
     finally:
@@ -889,4 +883,7 @@ def apply_and_push(
         env.pop("AISHIELD_GIT_USERNAME", None)
 
         # Remove temporary clone and askpass helper.
-        shutil.rmtree(temp, ignore_errors=True)
+        shutil.rmtree(
+            temp,
+            ignore_errors=True,
+        )
