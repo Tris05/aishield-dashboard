@@ -205,8 +205,12 @@ export default function ReportView({ token }: { token: string }) {
                 headers: { "Content-Type": "application/json", "X-AIShield-Viewer-Token": token },
                 body: JSON.stringify({ git_token: pat, branch_name: branch }),
             });
-            const d: ApplyResult = await r.json();
-            if (!r.ok) throw new Error(d.message || "Could not apply fixes");
+            const d = await r.json();
+            if (!r.ok) {
+                throw new Error(
+                    d.detail || d.message || `Apply failed (${r.status})`
+                );
+            }
             setResult(d);
             setPat("");
             setMessage(d.message);
